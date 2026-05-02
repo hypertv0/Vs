@@ -5,22 +5,19 @@ import os
 from playwright.sync_api import sync_playwright
 
 # --- Ayarlar ---
-# Ağ trafiğinden aldığımız orijinal User-Agent (CDN'ler kısa ajanları engelleyebilir, bu daha güvenli)
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
 
 def find_working_domain(context):
     print("\n🔍 Çalışan Varsports domaini aranıyor...")
-    # Genelde 100'den başlar 120'ye kadar gider, sen bu aralığı kendine göre değiştirebilirsin
     for num in range(104, 115):
         test_url = f"https://varsports{num}.shop/"
         page = context.new_page()
         try:
-            print(f"Denaniyor: {test_url}", end="\r")
+            print(f"Deneyiyor: {test_url}", end="\r")
             response = page.goto(test_url, timeout=8000, wait_until='domcontentloaded')
             if response and response.ok:
                 final_url = page.url.rstrip('/')
-                # Cloudflare kontrolü
-                if not any(x in page.title().lower() for x in["cloudflare", "just a moment", "bekleyin"]):
+                if not any(x in page.title().lower() for x in ["cloudflare", "just a moment", "bekleyin"]):
                     print(f"\n✅ Bulundu: {final_url}")
                     page.close()
                     return final_url
@@ -30,9 +27,46 @@ def find_working_domain(context):
             page.close()
     return None
 
+def get_iframe_base(context, domain):
+    print("🔍 Ana sayfadan güncel Iframe (Player) altyapısı çekiliyor...")
+    page = context.new_page()
+    iframe_base = None
+
+    # 1. Yöntem: Ağ trafiğinden ana sayfada yüklenen iframe'i yakalama
+    def intercept_iframe(request):
+        nonlocal iframe_base
+        if "/player/" in request.url and "?id=" in request.url:
+            # ?id= kısmından öncesini alıyoruz ki diğer kanallara baz (base) olsun
+            iframe_base = request.url.split("?id=")[0]
+
+    page.on("request", intercept_iframe)
+    try:
+        # Sitenin ana sayfasına git ve arka planda ağ trafiğinin (ve player'ın) yüklenmesini bekle
+        page.goto(domain, timeout=15000, wait_until="networkidle")
+        page.wait_for_timeout(3000) 
+    except:
+        pass
+    finally:
+        page.remove_listener("request", intercept_iframe)
+
+    # 2. Yöntem (Yedek): Eğer ağdan yakalayamazsa sayfa kaynağında iframe ara
+    if not iframe_base:
+        content = page.content()
+        match = re.search(r'(https?://[^"\'\s<>]+?/player/[^"\'\s<>]+?\.php)\?id=\d+', content)
+        if match:
+            iframe_base = match.group(1)
+
+    page.close()
+
+    if iframe_base:
+        print(f"✅ Iframe altyapısı bulundu: {iframe_base}")
+    else:
+        print("❌ Iframe altyapısı bulunamadı! Site yapısı değişmiş olabilir.")
+        
+    return iframe_base
+
 def main():
     with sync_playwright() as p:
-        # Cloudflare'a takılmamak için bazı ekstra parametreler eklendi
         browser = p.chromium.launch(
             headless=True,
             args=["--disable-blink-features=AutomationControlled"]
@@ -44,12 +78,15 @@ def main():
 
         domain = find_working_domain(context)
         if not domain:
-            print("\n❌ Çalışan domain bulunamadı.")
+            print("\n❌ Çalışan ana domain bulunamadı.")
             return
 
-        # Kanallar ve ID eşleşmeleri. 
-        # Ağ trafiğinde id=602 gördüğümüz için örnek olarak Bein1'e 602 verdim.
-        # Sitenin kaynak kodundan diğer kanalların ID'lerini bulup burayı DEĞİŞTİRMELİSİN.
+        # Zeka kısmı: Ana site üzerinden player Iframe URL'sini dinamik buluyoruz
+        iframe_base = get_iframe_base(context, domain)
+        if not iframe_base:
+            return
+
+        # Kanal Listesi (Sitenin ID'leri)
         channels = {
             "602": ("Bein Sports 1 HD", "BeinSports1.tr"),
             "603": ("Bein Sports 2 HD", "BeinSports2.tr"),
@@ -65,52 +102,63 @@ def main():
 
         output_dir = "kanallar"
         os.makedirs(output_dir, exist_ok=True)
-        global_playlist =["#EXTM3U"]
+        global_playlist = ["#EXTM3U"]
         
         page = context.new_page()
 
         for channel_id, (name, tvg_id) in channels.items():
             print(f"📡 Çekiliyor: {name} (ID: {channel_id})...", end=" ")
             try:
-                # Site yapısına göre kanala gitme URL'si (Site değiştikçe burayı güncellemen gerekebilir)
-                # Direkt iframe'e gitmek m3u8 yakalamayı kolaylaştırabilir:
-                url = f"https://benunluyumaskim.betconnectiframecdn1000.shop/player/player2.php?id={channel_id}"
-                
-                captured_url = None
+                # Dinamik bulduğumuz Iframe URL'sine o anki kanalın ID'sini ekliyoruz
+                url = f"{iframe_base}?id={channel_id}"
+                m3u8_links =[]
 
                 def handle_req(request):
-                    nonlocal captured_url
-                    # Ağ trafiğindeki .m3u8 dosyalarını yakala
-                    if ".m3u8" in request.url.lower():
-                        # Alt kalite dosyaları (mono, tracks vb.) yerine ana listeyi almak için filtreleme
-                        if "tracks" not in request.url.lower() and "mono" not in request.url.lower():
-                            captured_url = request.url
+                    url_str = request.url
+                    # Sadece .m3u8 uzantılı, içinde md5= ve expires= tokenları olan linkleri yakala
+                    if ".m3u8" in url_str.lower() and "md5=" in url_str.lower() and "expires=" in url_str.lower():
+                        m3u8_links.append(url_str)
 
                 page.on("request", handle_req)
                 
-                # İlgili yayın sayfasına git
-                page.goto(url, timeout=15000, wait_until="networkidle")
-                page.wait_for_timeout(4000) # Linkin ağa düşmesi için bekleme süresi
+                # Cloudflare'a takılmamak için Referer (Gelinen Yer) olarak ana siteyi gösteriyoruz
+                page.set_extra_http_headers({"Referer": f"{domain}/"})
+                
+                # Iframe'in (Yani Player'ın) içine direkt giriyoruz
+                page.goto(url, timeout=15000, wait_until="domcontentloaded")
+                page.wait_for_timeout(4000) # Linklerin ağ trafiğine düşmesi için bekle
+                
+                captured_url = None
+                if m3u8_links:
+                    # Gönderdiğin trafiği analiz ettim. Yayın iki parçadır. Biri ana (index), diğeri ses (mono/tracks). 
+                    # Biz içinde 'index' olan ana listeyi istiyoruz.
+                    for link in m3u8_links:
+                        if "index.m3u8" in link.lower():
+                            captured_url = link
+                            break
+                    # Eğer index yoksa, mecburen bulduğumuz ilk linki al
+                    if not captured_url:
+                        captured_url = m3u8_links[0]
 
                 if captured_url:
-                    # --- M3U8 Dosya İçeriği Oluşturma ---
                     content =[
                         "#EXTM3U",
                         f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{name}",{name}',
                         f"#EXTVLCOPT:http-user-agent={USER_AGENT}",
-                        f"#EXTVLCOPT:http-referrer={domain}/",
+                        # Oynatıcılarda sıkıntı çıkmaması için Referer olarak Iframe'i veriyoruz
+                        f"#EXTVLCOPT:http-referrer={iframe_base}/",
                         captured_url
                     ]
 
-                    # 1. Tekil Dosya Olarak Kaydet
+                    # Dosyaya kaydetme
                     clean_name = re.sub(r'[\\/*?:"<>|]', "", name).replace(" ", "_")
                     with open(os.path.join(output_dir, f"{clean_name}.m3u8"), "w", encoding="utf-8") as f:
                         f.write("\n".join(content))
 
-                    # 2. Genel Listeye Ekle
+                    # Genel listeye ekleme
                     global_playlist.append(f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{name}",{name}')
                     global_playlist.append(f"#EXTVLCOPT:http-user-agent={USER_AGENT}")
-                    global_playlist.append(f"#EXTVLCOPT:http-referrer={domain}/")
+                    global_playlist.append(f"#EXTVLCOPT:http-referrer={iframe_base}/")
                     global_playlist.append(captured_url)
                     
                     print("✅")
@@ -118,16 +166,16 @@ def main():
                     print("❌ Link yakalanamadı.")
 
             except Exception as e:
-                print("⚠️ Zaman Aşımı/Hata")
+                print("⚠️ Zaman Aşımı / Hata")
             finally:
                 page.remove_listener("request", handle_req)
 
-        # Tüm listeyi kaydet
+        # Tüm m3u8 listesini tek dosya yap
         with open("playlist.m3u", "w", encoding="utf-8") as f:
             f.write("\n".join(global_playlist))
 
         browser.close()
-        print("\n🎉 İşlem bitti. Yeni tokenli m3u8 dosyaları oluşturuldu.")
+        print("\n🎉 İşlem bitti. Dosyalar ExoPlayer / IPTV uyumlu hale getirildi.")
 
 if __name__ == "__main__":
     main()
