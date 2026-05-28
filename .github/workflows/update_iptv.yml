@@ -2,8 +2,8 @@ name: Otomatik Yayın Güncelleyici
 
 on:
   schedule:
-    # 0 * * * * demek, "her saat başı (örneğin 14:00, 15:00, 16:00)" çalıştır demektir.
-    - cron: '0 * * * *'
+    # Her yarım saatte bir (örneğin 14:00, 14:30, 15:00) çalışacak şekilde ayarlandı.
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 permissions:
